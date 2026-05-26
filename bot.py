@@ -5,12 +5,12 @@
 ╚══════════════════════════════════════════════════════════════╝
 
 পরিবেশ চলক (Railway Variables এ সেট করুন):
-  BOT_TOKEN          = 8820019369:AAGTrXB68QBWkHiv2DqJTSCYcax8BiOw8jY
-  ADMIN_ID           = 7200936473
-  PRIMARY_CHANNEL    = -1003708720278
-  BACKUP_CHANNEL     = -1003704307103
+  BOT_TOKEN          = your_bot_token
+  ADMIN_ID           = your_admin_id
+  PRIMARY_CHANNEL    = your_primary_channel_id
+  BACKUP_CHANNEL     = your_backup_channel_id
   GITHUB_TOKEN       = ghp_xxxxxxxxxxxx   (GitHub Personal Access Token)
-  GITHUB_USERNAME    = shimulpsd3030-sudo
+  GITHUB_USERNAME    = your_github_username
   GITHUB_REPO        = natok-hub          (repository নাম)
 """
 
@@ -79,6 +79,55 @@ async def gh_put_json(data: dict, sha: str, message: str) -> bool:
             return True
         log.error("GitHub PUT failed: %s — %s", r.status_code, r.text[:300])
         return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  THUMBNAIL — GITHUB এ UPLOAD করে PERMANENT URL নাও
+# ═══════════════════════════════════════════════════════════
+async def upload_thumb_to_github(bot, file_id: str, msg_id: int) -> str | None:
+    """
+    Telegram থেকে thumbnail download করে GitHub এ upload করে।
+    GitHub raw URL রিটার্ন করে — এটা permanent এবং website এ সবসময় দেখাবে।
+    """
+    try:
+        # Telegram থেকে file download করো
+        f = await bot.get_file(file_id)
+        thumb_bytes = await f.download_as_bytearray()
+
+        encoded  = base64.b64encode(bytes(thumb_bytes)).decode("utf-8")
+        filename = f"thumbs/thumb_{msg_id}.jpg"
+        api_url  = f"https://api.github.com/repos/{GH_USER}/{GH_REPO}/contents/{filename}"
+
+        # আগে আছে কিনা check করো (update এর জন্য sha লাগবে)
+        sha = None
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(api_url, headers=GH_HEADERS)
+            if r.status_code == 200:
+                sha = r.json().get("sha")
+
+        payload = {
+            "message": f"🖼️ Thumb for msg {msg_id}",
+            "content": encoded,
+            "branch":  "main",
+        }
+        if sha:
+            payload["sha"] = sha  # existing file update
+
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.put(api_url, headers=GH_HEADERS, json=payload)
+            if r.status_code in (200, 201):
+                permanent_url = (
+                    f"https://raw.githubusercontent.com/{GH_USER}/{GH_REPO}/main/{filename}"
+                )
+                log.info("🖼️ Thumbnail uploaded: %s", permanent_url)
+                return permanent_url
+            else:
+                log.error("Thumb upload failed: %s — %s", r.status_code, r.text[:200])
+
+    except Exception as e:
+        log.error("upload_thumb_to_github error: %s", e)
+
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -173,18 +222,6 @@ async def get_video_by_id(vid_id: int) -> dict | None:
 
 
 # ═══════════════════════════════════════════════════════════
-#  THUMBNAIL URL
-# ═══════════════════════════════════════════════════════════
-async def get_thumb_url(bot, file_id: str) -> str | None:
-    """Telegram file_id থেকে public URL বানায়।"""
-    try:
-        f = await bot.get_file(file_id)
-        return f.file_path          # Telegram CDN URL
-    except Exception:
-        return None
-
-
-# ═══════════════════════════════════════════════════════════
 #  CHANNEL POST HANDLER
 #  Primary ও Backup channel এ video আসলে চালায়
 # ═══════════════════════════════════════════════════════════
@@ -198,9 +235,9 @@ async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── ভিডিও বা ডকুমেন্ট (video file) চেক ──
-    video     = msg.video or msg.document
-    is_video  = bool(msg.video or (msg.document and msg.document.mime_type and
-                                   msg.document.mime_type.startswith("video")))
+    video    = msg.video or msg.document
+    is_video = bool(msg.video or (msg.document and msg.document.mime_type and
+                                  msg.document.mime_type.startswith("video")))
     if not is_video:
         return
 
@@ -208,12 +245,17 @@ async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     caption = msg.caption or (msg.video.file_name if msg.video else "") or ""
     title   = caption.strip()[:200] or f"ভিডিও — {msg_id}"
 
-    # thumbnail
+    # ── Thumbnail — GitHub এ upload করে permanent URL নাও ──
     thumb_url = None
     if msg.video and msg.video.thumbnail:
-        thumb_url = await get_thumb_url(ctx.bot, msg.video.thumbnail.file_id)
+        thumb_url = await upload_thumb_to_github(ctx.bot, msg.video.thumbnail.file_id, msg_id)
     elif msg.document and msg.document.thumbnail:
-        thumb_url = await get_thumb_url(ctx.bot, msg.document.thumbnail.file_id)
+        thumb_url = await upload_thumb_to_github(ctx.bot, msg.document.thumbnail.file_id, msg_id)
+
+    if thumb_url:
+        log.info("🖼️ Thumbnail ready: %s", thumb_url)
+    else:
+        log.warning("⚠️ No thumbnail for msg_id=%s", msg_id)
 
     category = _detect_category(caption)
     episode  = _detect_episode(caption)
@@ -223,17 +265,6 @@ async def on_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ok = await add_video(msg_id, title, thumb_url, category, episode)
     if ok:
         log.info("🌐 Website updated for msg_id=%s", msg_id)
-
-
-# ═══════════════════════════════════════════════════════════
-#  DELETED MESSAGE HANDLER  (channel_post delete)
-# ═══════════════════════════════════════════════════════════
-async def on_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Channel এ ভিডিও delete হলে website থেকেও সরায়।"""
-    if not hasattr(update, 'message') or not update.message:
-        return
-    # Telegram delete event আলাদাভাবে আসে না —
-    # তাই /remove কমান্ড দিয়ে manually সরানো যাবে (নিচে)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -250,7 +281,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 স্বাগতম {user.first_name}!\n\n"
             "🎬 NatokHub থেকে বাংলা নাটক দেখুন ফ্রিতে।\n\n"
-            "🌐 Website: https://shimulpsd3030-sudo.github.io/natok-hub/\n\n"
+            f"🌐 Website: https://{GH_USER}.github.io/{GH_REPO}/\n\n"
             "📢 Channel: @bachelor_point_bd",
             disable_web_page_preview=True
         )
@@ -293,7 +324,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not sent:
             await update.message.reply_text(
                 "❌ ভিডিওটি পাঠানো যায়নি।\n"
-                f"সরাসরি channel এ দেখুন: t.me/bachelor_point_bd"
+                "সরাসরি channel এ দেখুন: t.me/bachelor_point_bd"
             )
         return
 
@@ -361,7 +392,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not videos:
             await update.message.reply_text("কোনো ভিডিও নেই।")
             return
-        lines = [f"📋 *সর্বশেষ ভিডিও:*\n"]
+        lines = ["📋 *সর্বশেষ ভিডিও:*\n"]
         for v in videos:
             lines.append(
                 f"🎬 `{v['id']}` | msg:`{v['msgId']}` | {v['title'][:35]}"
